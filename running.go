@@ -23,8 +23,74 @@ import (
 	"sync"
 	"text/template"
 	"time"
-
+	"errors"
+	"runtime"
+	"strconv"
 	"github.com/sirupsen/logrus"
+)
+
+// This is terrible, slow, and should never be used.
+func goid() (int, error) {
+    buf := make([]byte, 32)
+    n := runtime.Stack(buf, false)
+    buf = buf[:n]
+    // goroutine 1 [running]: ...
+
+    buf, ok := bytes.CutPrefix(buf, goroutinePrefix)
+    if !ok {
+        return 0, errBadStack
+    }
+
+    i := bytes.IndexByte(buf, ' ')
+    if i < 0 {
+        return 0, errBadStack
+    }
+
+    return strconv.Atoi(string(buf[:i]))
+}
+
+type RecursiveMutex struct {
+	mutex            sync.Mutex
+	internalMutex    sync.Mutex
+	currentGoRoutine int
+	lockCount        uint64
+}
+
+func (rm *RecursiveMutex) Lock() {
+	goRoutineID, _ := goid()
+
+	for {
+		rm.internalMutex.Lock()
+		if rm.currentGoRoutine == 0 {
+			rm.currentGoRoutine = goRoutineID
+			break
+		} else if rm.currentGoRoutine == goRoutineID {
+			break
+		} else {
+			rm.internalMutex.Unlock()
+			time.Sleep(time.Millisecond)
+			continue
+		}
+	}
+	rm.lockCount++
+	rm.internalMutex.Unlock()
+}
+
+func (rm *RecursiveMutex) Unlock() {
+	rm.internalMutex.Lock()
+	rm.lockCount--
+	if rm.lockCount == 0 {
+		rm.currentGoRoutine = 0
+	}
+	rm.internalMutex.Unlock()
+}
+
+
+var (
+	goroutinePrefix = []byte("goroutine ")
+	errBadStack     = errors.New("invalid runtime.Stack output")
+	s RecursiveMutex
+
 )
 
 type RunningBox struct {
@@ -61,7 +127,7 @@ func (r *RunningBox) schedule(rsp IDLEEvent, done <-chan struct{}) {
 	when := time.Now().Add(wait).Format(time.RFC850)
 	format := fmt.Sprintf("%%s syncing %q for %s (%s in the future)", rsp.Reason, when, wait)
 
-	r.mutex[key].Lock()
+	s.Lock()
 	_, exists := r.timer[key]
 	main := true // main is true for the goroutine that will run sync
 	if exists {
@@ -73,7 +139,6 @@ func (r *RunningBox) schedule(rsp IDLEEvent, done <-chan struct{}) {
 	} else {
 		r.timer[key] = time.NewTimer(wait)
 	}
-	r.mutex[key].Unlock()
 
 	if main {
 		l.Infof(format, "scheduled")
@@ -86,6 +151,7 @@ func (r *RunningBox) schedule(rsp IDLEEvent, done <-chan struct{}) {
 	} else {
 		l.Infof(format, "rescheduled")
 	}
+	s.Unlock()
 }
 
 func (r *RunningBox) run(rsp IDLEEvent) {
